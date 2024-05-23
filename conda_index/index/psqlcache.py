@@ -1,90 +1,18 @@
 """
-cache conda indexing metadata in sqlite.
+Use sqlalchemy+postgresql instead of sqlite.
 """
 
-from __future__ import annotations
-
-import fnmatch
-import json
 import logging
-import os
-import os.path
-import sqlite3
-from os.path import join
 from pathlib import Path
-from typing import Any
-from zipfile import BadZipFile
 
-from conda_package_streaming import package_streaming
-
-from .. import yaml
-from ..utils import (
-    CONDA_PACKAGE_EXTENSION_V1,
-    CONDA_PACKAGE_EXTENSION_V2,
-    CONDA_PACKAGE_EXTENSIONS,
-    _checksum,
-)
-from . import common, convert_cache
-from .fs import FileInfo, MinimalFS
+from . import sqlitecache
+from .fs import MinimalFS, FileInfo
+from .sqlitecache import PATH_TO_TABLE, COMPUTED, TABLE_NO_CACHE
 
 log = logging.getLogger(__name__)
 
 
-INDEX_JSON_PATH = "info/index.json"
-ICON_PATH = "info/icon.png"
-PATHS_PATH = "info/paths.json"
-
-TABLE_TO_PATH = {
-    "index_json": INDEX_JSON_PATH,
-    "about": "info/about.json",
-    "paths": PATHS_PATH,
-    # will use the first one encountered
-    "recipe": (
-        "info/recipe/meta.yaml",
-        "info/recipe/meta.yaml.rendered",
-        "info/meta.yaml",
-    ),
-    # run_exports is rare but used. see e.g. gstreamer.
-    # prevents 90% of early tar.bz2 exits.
-    # also found in meta.yaml['build']['run_exports']
-    "run_exports": "info/run_exports.json",
-    "post_install": "info/post_install.json",  # computed
-    "icon": ICON_PATH,  # very rare, 16 conda-forge packages
-    # recipe_log: always {} in old version of cache
-}
-
-PATH_TO_TABLE = {}
-
-for k, v in TABLE_TO_PATH.items():
-    if isinstance(v, str):
-        PATH_TO_TABLE[v] = k
-    else:
-        for path in v:
-            PATH_TO_TABLE[path] = k
-
-# read, but not saved for later
-TABLE_NO_CACHE = {
-    "paths",
-}
-
-# saved to cache, not found in package
-COMPUTED = {"info/post_install.json"}
-
-
-# lock-free replacement for @cached_property
-class cacher:
-    def __init__(self, wrapped):
-        self.wrapped = wrapped
-
-    def __get__(self, inst, objtype=None) -> Any:
-        if inst:
-            value = self.wrapped(inst)
-            setattr(inst, self.wrapped.__name__, value)
-            return value
-        return self
-
-
-class CondaIndexCache:
+class PsqlCache(sqlitecache.CondaIndexCache):
     upstream_stage = "fs"
 
     def __init__(
@@ -128,16 +56,11 @@ class CondaIndexCache:
     def __setstate__(self, d):
         self.__dict__ = d
 
-    @cacher
-    def db(self) -> sqlite3.Connection:
+    def db(self):
         """
-        Connection to our sqlite3 database.
+        Connection to our sqlalchemy database.
         """
-        conn = common.connect(str(self.db_filename))
-        with conn:
-            convert_cache.create(conn)
-            convert_cache.migrate(conn)
-        return conn
+        return None
 
     def close(self):
         """
@@ -309,6 +232,7 @@ class CondaIndexCache:
             paths_str = ""
         have["info/post_install.json"] = _cache_post_install_details(paths_str)
 
+        # abstract this out, share above code with
         with self.db:
             for have_path in have:
                 table = PATH_TO_TABLE[have_path]
@@ -541,81 +465,3 @@ class CondaIndexCache:
                 VALUES ('indexed', ?, ?, ?, ?, ?)""",
             (database_path, mtime, size, index_json["sha256"], index_json["md5"]),
         )
-
-    def run_exports(self):
-        """
-        Query returning run_exports data, to be formatted by
-        ChannelIndex.build_run_exports_data()
-        """
-        return self.db.execute(
-            """
-            SELECT path, run_exports FROM stat
-            LEFT JOIN run_exports USING (path)
-            WHERE stat.stage = ?
-            ORDER BY path
-            """,
-            (self.upstream_stage,),
-        )
-
-
-def _cache_post_install_details(paths_json_str):
-    post_install_details_json = {
-        "binary_prefix": False,
-        "text_prefix": False,
-        "activate.d": False,
-        "deactivate.d": False,
-        "pre_link": False,
-        "post_link": False,
-        "pre_unlink": False,
-    }
-    if paths_json_str:  # if paths exists at all
-        paths = json.loads(paths_json_str).get("paths", [])
-
-        # get embedded prefix data from paths.json
-        for f in paths:
-            if f.get("prefix_placeholder"):
-                if f.get("file_mode") == "binary":
-                    post_install_details_json["binary_prefix"] = True
-                elif f.get("file_mode") == "text":
-                    post_install_details_json["text_prefix"] = True
-            # check for any activate.d/deactivate.d scripts
-            for k in ("activate.d", "deactivate.d"):
-                if not post_install_details_json.get(k) and f["_path"].startswith(
-                    f"etc/conda/{k}"
-                ):
-                    post_install_details_json[k] = True
-            # check for any link scripts
-            for pat in ("pre-link", "post-link", "pre-unlink"):
-                if not post_install_details_json.get(pat) and fnmatch.fnmatch(
-                    f["_path"], f"*/.*-{pat}.*"
-                ):
-                    post_install_details_json[pat.replace("-", "_")] = True
-
-    return json.dumps(post_install_details_json)
-
-
-def _cache_recipe(recipe_reader):
-    recipe_json = yaml.determined_load(recipe_reader)
-
-    try:
-        recipe_json_str = json.dumps(recipe_json)
-    except TypeError:
-        recipe_json.get("requirements", {}).pop("build")  # weird
-        recipe_json_str = json.dumps(recipe_json)
-
-    return recipe_json_str
-
-
-def _clear_newline_chars(record, field_name):
-    if field_name in record:
-        try:
-            record[field_name] = record[field_name].strip().replace("\n", " ")
-        except AttributeError:
-            try:
-                # sometimes description gets added as a list instead of just a string
-                record[field_name] = (
-                    "".join(record[field_name]).strip().replace("\n", " ")
-                )
-
-            except TypeError:
-                log.warn("Could not _clear_newline_chars from field %s", field_name)
